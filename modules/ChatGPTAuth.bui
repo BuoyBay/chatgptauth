@@ -1,0 +1,776 @@
+Import crypto
+
+Private Declare Function VerifyRSA Lib "buoy_chatgptauth" Alias "bca_verify_rs256" (modulus As Ptr, modulusLength As Integer, exponent As Ptr, exponentLength As Integer, message As Ptr, messageLength As Integer, signature As Ptr, signatureLength As Integer) As Integer
+Const Resource As String = "https://api.openai.com/v1"
+Const IdentityScopes As String = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
+Const DynamicClient As String = "dynamic_agent_client"
+
+Private Function Exact(a As String, b As String) As Boolean
+    Return String.Compare(a, b, True) = 0
+End Function
+
+Private Function Utf8(source As String) As Bytes
+    Return Bytes.FromString(source, Text.Encodings.UTF8)
+End Function
+
+Private Function SameSecret(a As String, b As String) As Boolean
+    Return Crypto.ConstantTimeEquals(Utf8(a), Utf8(b))
+End Function
+
+Private Function UnixNow() As Integer
+    Return DateTime.Now().SecondsFrom1970
+End Function
+
+Public Function Base64URL(data As Bytes) As String
+    If data = Nil Then Throw New InvalidArgumentException("Bytes are required")
+    Dim encoded As String = data.ToBase64()
+    encoded = String.Replace(encoded, "+", "-", True)
+    encoded = String.Replace(encoded, "/", "_", True)
+    Return String.Replace(encoded, "=", "", True)
+End Function
+
+Private Function DecodeBase64URL(source As String) As Bytes
+    If source = "" Or String.Len(source) > 1048576 Then Throw New InvalidArgumentException("Invalid token encoding")
+    For Each character As String In String.Chars(source)
+        Dim scalar As Integer = String.Asc(character)
+        If Not ((scalar >= 65 And scalar <= 90) Or (scalar >= 97 And scalar <= 122) Or (scalar >= 48 And scalar <= 57) Or scalar = 45 Or scalar = 95) Then Throw New InvalidArgumentException("Invalid token encoding")
+    Next
+    Dim standard As String = String.Replace(String.Replace(source, "-", "+", True), "_", "/", True)
+    While String.Len(standard) Mod 4 <> 0
+        standard += "="
+    End While
+    Dim decoded As Result Of Bytes, String = Bytes.FromBase64(standard)
+    If decoded.IsErr Then Throw New InvalidArgumentException("Invalid token encoding")
+    If Not Exact(Base64URL(decoded.Value), source) Then Throw New InvalidArgumentException("Noncanonical token encoding")
+    Return decoded.Value
+End Function
+
+''' RFC 7636 S256 challenge; verifier must contain 43..128 unreserved ASCII characters.
+Public Function PKCEChallenge(verifier As String) As String
+    Dim count As Integer = String.Len(verifier)
+    If count < 43 Or count > 128 Then Throw New InvalidArgumentException("Invalid PKCE verifier length")
+    For Each character As String In String.Chars(verifier)
+        Dim scalar As Integer = String.Asc(character)
+        If Not ((scalar >= 65 And scalar <= 90) Or (scalar >= 97 And scalar <= 122) Or (scalar >= 48 And scalar <= 57) Or String.Contains("-._~", character, True)) Then Throw New InvalidArgumentException("Invalid PKCE verifier character")
+    Next
+    Return Base64URL(Crypto.Hash(Crypto.HashAlgorithms.SHA256, Utf8(verifier)))
+End Function
+
+''' Generate once per installation/host and save separately from account registrations.
+Public Function NewChatGPTHostID() As String
+    Dim bytes As Bytes = Crypto.RandomBytes(16)
+    bytes.SetItem(6, (bytes.Item(6) And 15) Or 64)
+    bytes.SetItem(8, (bytes.Item(8) And 63) Or 128)
+    Dim hex As String = bytes.ToHex()
+    Return "urn:uuid:" + String.Left(hex, 8) + "-" + String.Substring(hex, 8, 4) + "-" + String.Substring(hex, 12, 4) + "-" + String.Substring(hex, 16, 4) + "-" + String.Right(hex, 12)
+End Function
+
+Private Function Encode(source As String) As String
+    Dim data As Bytes = Utf8(source)
+    Dim output As String = ""
+    Const HexDigits As String = "0123456789ABCDEF"
+    For i As Integer = 0 To data.Count - 1
+        Dim octet As Integer = data.Item(i)
+        If (octet >= 65 And octet <= 90) Or (octet >= 97 And octet <= 122) Or (octet >= 48 And octet <= 57) Or octet = 45 Or octet = 46 Or octet = 95 Or octet = 126 Then
+            output += String.Chr(octet)
+        Else
+            output += "%" + String.Substring(HexDigits, octet \ 16, 1) + String.Substring(HexDigits, octet Mod 16, 1)
+        End If
+    Next
+    Return output
+End Function
+
+Private Function HexValue(octet As Integer) As Integer
+    If octet >= 48 And octet <= 57 Then Return octet - 48
+    If octet >= 65 And octet <= 70 Then Return octet - 55
+    If octet >= 97 And octet <= 102 Then Return octet - 87
+    Return -1
+End Function
+
+Private Function Decode(source As String) As String
+    Dim data As Bytes = Utf8(source)
+    Dim output As New Bytes()
+    Dim i As Integer = 0
+    While i < data.Count
+        Dim octet As Integer = data.Item(i)
+        If octet = 37 Then
+            If i + 2 >= data.Count Then Throw New InvalidArgumentException("Malformed callback encoding")
+            Dim high As Integer = HexValue(data.Item(i + 1))
+            Dim low As Integer = HexValue(data.Item(i + 2))
+            If high < 0 Or low < 0 Then Throw New InvalidArgumentException("Malformed callback encoding")
+            output.Append(high * 16 + low)
+            i += 3
+        Else
+            If octet = 43 Then octet = 32
+            output.Append(octet)
+            i += 1
+        End If
+    End While
+    Return output.ToString(Text.Encodings.UTF8)
+End Function
+
+Private Sub ValidateJSONNumber(token As String)
+    Dim data As Bytes = Utf8(token)
+    Dim i As Integer = 0
+    Dim count As Integer = data.Count
+    If count > 0 Then
+        If data.Item(0) = 45 Then i = 1
+    End If
+    If i >= count Then Throw New InvalidArgumentException("Invalid authentication JSON number")
+    Dim first As Integer = data.Item(i)
+    If first = 48 Then
+        i += 1
+    Else
+        If first < 49 Or first > 57 Then Throw New InvalidArgumentException("Invalid authentication JSON number")
+        i += 1
+        While i < count
+            Dim scalar As Integer = data.Item(i)
+            If scalar < 48 Or scalar > 57 Then Exit While
+            i += 1
+        End While
+    End If
+    If i < count Then
+        If data.Item(i) = 46 Then
+            i += 1
+            Dim digits As Integer = 0
+            While i < count
+                Dim scalar As Integer = data.Item(i)
+                If scalar < 48 Or scalar > 57 Then Exit While
+                i += 1
+                digits += 1
+            End While
+            If digits = 0 Then Throw New InvalidArgumentException("Invalid authentication JSON number")
+        End If
+    End If
+    If i < count Then
+        Dim exponentMarker As Integer = data.Item(i)
+        If exponentMarker = 101 Or exponentMarker = 69 Then
+            i += 1
+            If i < count Then
+                Dim sign As Integer = data.Item(i)
+                If sign = 43 Or sign = 45 Then i += 1
+            End If
+            Dim digits As Integer = 0
+            While i < count
+                Dim scalar As Integer = data.Item(i)
+                If scalar < 48 Or scalar > 57 Then Exit While
+                i += 1
+                digits += 1
+            End While
+            If digits = 0 Then Throw New InvalidArgumentException("Invalid authentication JSON number")
+        End If
+    End If
+    If i <> count Then Throw New InvalidArgumentException("Invalid authentication JSON number")
+End Sub
+
+' Bound nesting and validate lexical forms before the runtime JSON parser sees untrusted text.
+Private Function ParseAuthJSON(source As String) As JSONItem
+    Dim data As Bytes = Utf8(source)
+    If data.Count > 1048576 Then Throw New InvalidArgumentException("Authentication JSON is too large")
+    data.ToString(Text.Encodings.UTF8)
+    Dim depth As Integer = 0
+    Dim quoted As Boolean = False
+    Dim i As Integer = 0
+    While i < data.Count
+        Dim octet As Integer = data.Item(i)
+        If octet = 0 Then Throw New InvalidArgumentException("NUL is not permitted in authentication JSON")
+        If quoted Then
+            If octet < 32 Then Throw New InvalidArgumentException("Control character in authentication JSON string")
+            If octet = 34 Then
+                quoted = False
+            ElseIf octet = 92 Then
+                i += 1
+                If i >= data.Count Then Throw New InvalidArgumentException("Truncated authentication JSON escape")
+                Dim escape As Integer = data.Item(i)
+                If escape = 117 Then
+                    If i + 4 >= data.Count Then Throw New InvalidArgumentException("Truncated authentication JSON Unicode escape")
+                    Dim codepoint As Integer = 0
+                    For j As Integer = 1 To 4
+                        Dim value As Integer = HexValue(data.Item(i + j))
+                        If value < 0 Then Throw New InvalidArgumentException("Invalid authentication JSON Unicode escape")
+                        codepoint = codepoint * 16 + value
+                    Next
+                    If codepoint = 0 Then Throw New InvalidArgumentException("Escaped NUL is not permitted in authentication JSON")
+                    i += 4
+                    If codepoint >= 55296 And codepoint <= 56319 Then
+                        If i + 6 >= data.Count Then Throw New InvalidArgumentException("Unpaired authentication JSON surrogate")
+                        If data.Item(i + 1) <> 92 Or data.Item(i + 2) <> 117 Then Throw New InvalidArgumentException("Unpaired authentication JSON surrogate")
+                        Dim low As Integer = 0
+                        For j As Integer = 3 To 6
+                            Dim value As Integer = HexValue(data.Item(i + j))
+                            If value < 0 Then Throw New InvalidArgumentException("Invalid authentication JSON Unicode escape")
+                            low = low * 16 + value
+                        Next
+                        If low < 56320 Or low > 57343 Then Throw New InvalidArgumentException("Unpaired authentication JSON surrogate")
+                        i += 6
+                    ElseIf codepoint >= 56320 And codepoint <= 57343 Then
+                        Throw New InvalidArgumentException("Unpaired authentication JSON surrogate")
+                    End If
+                ElseIf escape <> 34 And escape <> 92 And escape <> 47 And escape <> 98 And escape <> 102 And escape <> 110 And escape <> 114 And escape <> 116 Then
+                    Throw New InvalidArgumentException("Invalid authentication JSON escape")
+                End If
+            End If
+        ElseIf octet = 34 Then
+            quoted = True
+        ElseIf octet = 91 Or octet = 123 Then
+            depth += 1
+            If depth > 64 Then Throw New InvalidArgumentException("Authentication JSON exceeds nesting limit")
+        ElseIf octet = 93 Or octet = 125 Then
+            depth -= 1
+            If depth < 0 Then Throw New InvalidArgumentException("Unbalanced authentication JSON")
+        ElseIf octet <> 32 And octet <> 9 And octet <> 10 And octet <> 13 And octet <> 44 And octet <> 58 Then
+            Dim token As New Bytes()
+            While i < data.Count
+                Dim current As Integer = data.Item(i)
+                If current = 32 Or current = 9 Or current = 10 Or current = 13 Or current = 44 Or current = 58 Or current = 91 Or current = 93 Or current = 123 Or current = 125 Or current = 34 Then Exit While
+                token.Append(current)
+                i += 1
+            End While
+            Dim text As String = token.ToString(Text.Encodings.UTF8)
+            If Not Exact(text, "true") And Not Exact(text, "false") And Not Exact(text, "null") Then ValidateJSONNumber(text)
+            i -= 1
+        End If
+        i += 1
+    End While
+    If quoted Or depth <> 0 Then Throw New InvalidArgumentException("Incomplete authentication JSON")
+    Dim parsed As Optional Of JSONItem = Json.TryParse(source)
+    If Not parsed.HasValue Then Throw New InvalidArgumentException("Malformed authentication JSON")
+    Return parsed.Value
+End Function
+
+Private Function RequiredString(item As JSONItem, name As String) As String
+    Dim value As JSONItem = item.Value(name)
+    If Not value.IsString() Then Throw New InvalidArgumentException("Missing authentication field: " + name)
+    Dim text As String = value.AsString().Value
+    If text = "" Then Throw New InvalidArgumentException("Empty authentication field: " + name)
+    Return text
+End Function
+
+Private Function NumberField(item As JSONItem, name As String) As Integer
+    Dim value As JSONItem = item.Value(name)
+    If Not value.IsNumber() Then Throw New InvalidArgumentException("Missing authentication numeric field")
+    Dim number As Double = value.AsNumber().Value
+    If number < 0.0 Or number > 9007199254740991.0 Then Throw New InvalidArgumentException("Invalid authentication numeric field")
+    Dim integral As Integer = number
+    If integral <> number Then Throw New InvalidArgumentException("Authentication numeric field must be integral")
+    Return integral
+End Function
+
+Private Function HasScope(scopes As String, target As String) As Boolean
+    For Each scope As String In String.Split(scopes, " ")
+        If Exact(scope, target) Then Return True
+    Next
+    Return False
+End Function
+
+Private Sub ValidateLabel(value As String)
+    If String.Trim(value) = "" Or String.Len(value) > 256 Then Throw New InvalidArgumentException("App name and host ID must be nonempty and at most 256 characters")
+    For Each character As String In String.Chars(value)
+        If String.Asc(character) < 32 Or String.Asc(character) = 127 Then Throw New InvalidArgumentException("Control characters are not allowed")
+    Next
+End Sub
+
+Private Sub ValidateCallbackPath(callbackPath As String)
+    If Not String.StartsWith(callbackPath, "/", True) Or String.Len(callbackPath) > 256 Then Throw New InvalidArgumentException("Invalid callback path")
+    For Each character As String In String.Chars(callbackPath)
+        Dim scalar As Integer = String.Asc(character)
+        If Not ((scalar >= 65 And scalar <= 90) Or (scalar >= 97 And scalar <= 122) Or (scalar >= 48 And scalar <= 57) Or String.Contains("/-._", character, True)) Then Throw New InvalidArgumentException("Invalid callback path")
+    Next
+End Sub
+
+Internal Class ChatGPTTokens
+    Public Property Access As String
+    Public Property Refresh As String
+    Public Property Identity As String
+    Public Property Scopes As String
+    Public Property Expires As Integer
+    Public Property EarliestRefresh As Integer
+    Public Property Received As Integer
+End Class
+
+''' One issued client/account registration. Secrets have explicit accessors and are never logged or persisted.
+Public Class ChatGPTProfile
+    Internal Property Tokens As ChatGPTTokens
+    Internal Property Nonce As String
+    Internal Property CallbackPath As String
+    Internal Property IssuerValue As String
+    Internal Property ClientValue As String
+    Internal Property HostValue As String
+    Internal Property SubjectValue As String
+    Internal Property EmailValue As String
+
+    Internal Sub Constructor()
+    End Sub
+
+    Public Property Subject As String
+        Get
+            Return Me.SubjectValue
+        End Get
+    End Property
+    Public Property Email As String
+        Get
+            Return Me.EmailValue
+        End Get
+    End Property
+    Public Property ClientID As String
+        Get
+            Return Me.ClientValue
+        End Get
+    End Property
+    Public Property HostID As String
+        Get
+            Return Me.HostValue
+        End Get
+    End Property
+    Public Property Issuer As String
+        Get
+            Return Me.IssuerValue
+        End Get
+    End Property
+    Public Property PlanEnabled As Boolean
+        Get
+            If Me.Tokens = Nil Then Return False
+            Return HasScope(Me.Tokens.Scopes, "chatgpt.tokens.use.direct") And HasScope(Me.Tokens.Scopes, "resource.invoke")
+        End Get
+    End Property
+    Public Property ExpiresAt As Integer
+        Get
+            If Me.Tokens = Nil Then Return 0
+            Return Me.Tokens.Expires
+        End Get
+    End Property
+    Public Property GrantedScopes As String
+        Get
+            If Me.Tokens = Nil Then Return ""
+            Return Me.Tokens.Scopes
+        End Get
+    End Property
+
+    ''' Explicit bearer-token access. Requires current plan permission and an unexpired session.
+    Public Function AccessToken() As String
+        If Not Me.PlanEnabled Then Throw New InvalidArgumentException("ChatGPT plan permission is not enabled")
+        If Me.Tokens.Expires <= UnixNow() Then Throw New InvalidArgumentException("ChatGPT session requires refresh")
+        Return Me.Tokens.Access
+    End Function
+
+    ''' Explicit per-child Codex env_key handoff; caller must never log this map.
+    Public Function ChildEnvironment() As Map Of String, String
+        Dim environment As New Map Of String, String()
+        environment.Set("ACCESS_TOKEN", Me.AccessToken())
+        Return environment
+    End Function
+
+    ''' Explicit secret export for host-managed protected storage; never include this in diagnostics.
+    Public Function ExportCredentials() As JSONItem
+        Dim output As JSONItem = JSONItem.NewObject()
+        output.Value("issuer") = Me.IssuerValue
+        output.Value("subject") = Me.SubjectValue
+        output.Value("email") = Me.EmailValue
+        output.Value("client_id") = Me.ClientValue
+        output.Value("ext_agent_host_id") = Me.HostValue
+        output.Value("callback_path") = Me.CallbackPath
+        output.Value("nonce") = Me.Nonce
+        If Me.Tokens <> Nil Then
+            output.Value("access_token") = Me.Tokens.Access
+            output.Value("refresh_token") = Me.Tokens.Refresh
+            output.Value("id_token") = Me.Tokens.Identity
+            output.Value("scope") = Me.Tokens.Scopes
+            output.Value("expires_at") = Me.Tokens.Expires
+            output.Value("saved_at") = Me.Tokens.Received
+            output.Value("earliest_refresh_at") = Me.Tokens.EarliestRefresh
+        End If
+        Return output
+    End Function
+
+    ''' Local sign-out fallback. A caller must separately report unconfirmed remote revocation.
+    Public Sub ClearCredentials()
+        Me.Tokens = Nil
+        Me.Nonce = ""
+    End Sub
+End Class
+
+''' A single-use pending attempt, independent of the active account.
+Public Class ChatGPTSignIn
+    Internal Property Owner As ChatGPTAuthClient
+    Internal Property Profile As ChatGPTProfile
+    Internal Property StateValue As String
+    Internal Property NonceValue As String
+    Internal Property Verifier As String
+    Internal Property RedirectURI As String
+    Internal Property PathValue As String
+    Internal Property ClientValue As String
+    Internal Property Code As String
+    Internal Property CallbackReady As Boolean = False
+    Internal Property Used As Boolean = False
+    Internal Property StartedAt As Integer
+    Private Property URLValue As String
+
+    Internal Sub Constructor(owner As ChatGPTAuthClient, selected As ChatGPTProfile, port As Integer, callbackPath As String)
+        If port < 1 Or port > 65535 Then Throw New InvalidArgumentException("Invalid loopback port")
+        ValidateCallbackPath(callbackPath)
+        Me.Owner = owner
+        Me.Profile = selected
+        Me.StateValue = Base64URL(Crypto.RandomBytes(32))
+        Me.NonceValue = Base64URL(Crypto.RandomBytes(32))
+        Me.Verifier = Base64URL(Crypto.RandomBytes(32))
+        Me.RedirectURI = "http://127.0.0.1:" + String.From(port) + callbackPath
+        Me.PathValue = callbackPath
+        Me.StartedAt = UnixNow()
+        Dim requestedClient As String = DynamicClient
+        Dim extras As String = "&agent_name_hint=" + Encode(owner.AppName)
+        If selected <> Nil Then
+            requestedClient = selected.ClientID
+            extras = ""
+            If selected.Tokens <> Nil Then
+                extras += "&id_token_hint=" + Encode(selected.Tokens.Identity)
+                If selected.Email <> "" Then extras += "&login_hint=" + Encode(selected.Email)
+            End If
+        End If
+        Me.ClientValue = requestedClient
+        Me.URLValue = owner.IssuerURL + "/api/accounts/authorize?client_id=" + Encode(requestedClient) + extras + "&ext_agent_host_id=" + Encode(owner.HostID) + "&response_type=code&redirect_uri=" + Encode(Me.RedirectURI) + "&scope=" + Encode(IdentityScopes) + "&resource=" + Encode(Resource) + "&state=" + Encode(Me.StateValue) + "&nonce=" + Encode(Me.NonceValue) + "&code_challenge_method=S256&code_challenge=" + Encode(PKCEChallenge(Me.Verifier))
+    End Sub
+
+    ''' Contains an ID-token hint for returning sign-in; do not log authorization URLs.
+    Public Property AuthorizationURL As String
+        Get
+            Return Me.URLValue
+        End Get
+    End Property
+    Public Property CallbackURI As String
+        Get
+            Return Me.RedirectURI
+        End Get
+    End Property
+
+    Public Sub Cancel()
+        Me.Used = True
+        Me.Code = ""
+        Me.Verifier = ""
+        Me.StateValue = ""
+        Me.NonceValue = ""
+        Me.URLValue = ""
+    End Sub
+
+    Public Sub AcceptCallback(callbackURL As String)
+        If Me.Used Or Me.CallbackReady Or UnixNow() - Me.StartedAt > 600 Then Throw New InvalidArgumentException("Sign-in attempt is no longer pending")
+        If String.LenBytes(callbackURL) > 32768 Then Throw New InvalidArgumentException("Callback is too large")
+        Dim question As Integer = String.IndexOf(callbackURL, "?", 0, True)
+        If question < 0 Or String.IndexOf(callbackURL, "#", 0, True) >= 0 Then Throw New InvalidArgumentException("Invalid callback URI")
+        If Not Exact(String.Left(callbackURL, question), Me.RedirectURI) Then Throw New InvalidArgumentException("Callback URI does not match pending attempt")
+        Dim fields As New Map Of String, String()
+        For Each pair As String In String.Split(String.Substring(callbackURL, question + 1), "&")
+            Dim equals As Integer = String.IndexOf(pair, "=", 0, True)
+            If equals < 1 Then Throw New InvalidArgumentException("Malformed callback parameters")
+            Dim key As String = Decode(String.Left(pair, equals))
+            For Each reserved As String In ["state", "code", "client_id", "error"]
+                If String.Compare(key, reserved, False) = 0 And Not Exact(key, reserved) Then Throw New InvalidArgumentException("Callback parameter names are case-sensitive")
+            Next
+            If fields.ContainsKey(key) Then Throw New InvalidArgumentException("Duplicate callback parameters")
+            fields.Set(key, Decode(String.Substring(pair, equals + 1)))
+        Next
+        If Not SameSecret(fields.Get("state").Or(""), Me.StateValue) Then Throw New InvalidArgumentException("Callback state does not match pending attempt")
+        If fields.ContainsKey("error") Then
+            Me.Cancel()
+            Throw New InvalidArgumentException("ChatGPT authorization was denied or failed")
+        End If
+        Dim issuedClient As String = fields.Get("client_id").Or("")
+        If Exact(Me.ClientValue, DynamicClient) Then
+            If issuedClient = "" Or Exact(issuedClient, DynamicClient) Then Throw New InvalidArgumentException("Registration did not return an issued client ID")
+        ElseIf issuedClient <> "" Then
+            If Not Exact(issuedClient, Me.ClientValue) Then Throw New InvalidArgumentException("Callback client does not match selected registration")
+        End If
+        Dim codeValue As String = fields.Get("code").Or("")
+        If codeValue = "" Then Throw New InvalidArgumentException("Authorization code is missing")
+        If Exact(Me.ClientValue, DynamicClient) Then Me.ClientValue = issuedClient
+        Me.Code = codeValue
+        Me.CallbackReady = True
+    End Sub
+End Class
+
+''' Public-client OAuth coordinator. Production endpoints are fixed to auth.openai.com.
+Public Class ChatGPTAuthClient
+    Internal Property AppName As String
+    Internal Property HostID As String
+    Internal Property IssuerURL As String = "https://auth.openai.com"
+
+    Public Sub Constructor(appName As String, hostID As String)
+        ValidateLabel(appName)
+        ValidateLabel(hostID)
+        Me.AppName = appName
+        Me.HostID = hostID
+    End Sub
+
+    ''' Fixture-only HTTP origin, accepted only for exact 127.0.0.1 plus an explicit port.
+    Public Shared Function ForLoopbackTesting(appName As String, hostID As String, issuerURL As String) As ChatGPTAuthClient
+        Const Prefix As String = "http://127.0.0.1:"
+        If Not String.StartsWith(issuerURL, Prefix, True) Then Throw New InvalidArgumentException("Fixture issuer must use exact IPv4 loopback")
+        Dim portText As String = String.Substring(issuerURL, String.Len(Prefix))
+        Dim parsed As Result Of Integer, String = Integer.Parse(portText)
+        If parsed.IsErr Then Throw New InvalidArgumentException("Fixture issuer requires one port")
+        If parsed.Value < 1 Or parsed.Value > 65535 Or Not Exact(String.From(parsed.Value), portText) Then Throw New InvalidArgumentException("Invalid fixture port")
+        Dim client As New ChatGPTAuthClient(appName, hostID)
+        client.IssuerURL = issuerURL
+        Return client
+    End Function
+
+    Public Function Begin(port As Integer, callbackPath As String = "/auth/callback") As ChatGPTSignIn
+        Return New ChatGPTSignIn(Me, Nil, port, callbackPath)
+    End Function
+
+    Public Function BeginForProfile(profile As ChatGPTProfile, port As Integer) As ChatGPTSignIn
+        Me.RequireProfile(profile)
+        Return New ChatGPTSignIn(Me, profile, port, profile.CallbackPath)
+    End Function
+
+    Private Sub RequireProfile(profile As ChatGPTProfile)
+        If profile = Nil Then Throw New InvalidArgumentException("Profile is required")
+        If Not Exact(profile.HostID, Me.HostID) Or Not Exact(profile.Issuer, Me.IssuerURL) Then Throw New InvalidArgumentException("Profile belongs to another host or issuer")
+        If profile.ClientID = "" Or Exact(profile.ClientID, DynamicClient) Then Throw New InvalidArgumentException("Profile has no issued client ID")
+    End Sub
+
+    Private Function RequestJSON(endpoint As String, form As String, post As Boolean) As JSONItem
+        Dim connection As New URLConnection()
+        connection.FollowRedirects = False
+        connection.VerifySSL = True
+        connection.Timeout = 30
+        connection.ConnectionTimeout = 15
+        connection.RequestHeaders.Set("Accept", "application/json")
+        connection.RequestHeaders.Set("Content-Type", "application/x-www-form-urlencoded")
+        Dim body As String
+        Try
+            If post Then
+                body = connection.Post(endpoint, form)
+            Else
+                body = connection.Get(endpoint)
+            End If
+        Catch e As NetworkingException
+            Throw New NetworkingException("ChatGPT authentication transport failed")
+        End Try
+        If connection.HTTPStatus = 429 Or connection.HTTPStatus >= 500 Then Throw New NetworkingException("ChatGPT authentication endpoint temporarily unavailable")
+        If connection.HTTPStatus <> 200 Then Throw New InvalidArgumentException("ChatGPT authentication endpoint returned HTTP " + String.From(connection.HTTPStatus))
+        If String.LenBytes(body) > 1048576 Then Throw New InvalidArgumentException("Authentication response exceeds size limit")
+        Dim parsed As JSONItem = ParseAuthJSON(body)
+        If Not parsed.IsObject() Then Throw New InvalidArgumentException("Authentication endpoint returned a non-object")
+        Return parsed
+    End Function
+
+    Private Function TrustedEndpoint(value As String) As String
+        If Not String.StartsWith(value, Me.IssuerURL + "/", True) Or String.Contains(value, "\\", True) Or String.Contains(value, "#", True) Then Throw New InvalidArgumentException("Discovery endpoint is outside trusted issuer")
+        Return value
+    End Function
+
+    Private Function Discovery() As JSONItem
+        Dim metadata As JSONItem = Me.RequestJSON(Me.IssuerURL + "/.well-known/openid-configuration", "", False)
+        If Not Exact(RequiredString(metadata, "issuer"), Me.IssuerURL) Then Throw New InvalidArgumentException("Discovery issuer does not match")
+        If Not Exact(RequiredString(metadata, "token_endpoint"), Me.IssuerURL + "/api/accounts/oauth/token") Then Throw New InvalidArgumentException("Unexpected OAuth token endpoint")
+        Return metadata
+    End Function
+
+    Private Function VerifyIdentity(token As String, issuedClient As String, nonce As String, requireNonce As Boolean, metadata As JSONItem, allowExpired As Boolean = False) As JSONItem
+        If String.LenBytes(token) > 1048576 Then Throw New InvalidArgumentException("ID token is too large")
+        Dim pieces As Array Of String = String.Split(token, ".")
+        If Array.Count(pieces) <> 3 Then Throw New InvalidArgumentException("Malformed ID token")
+        Dim header As JSONItem
+        Dim claims As JSONItem
+        Try
+            header = ParseAuthJSON(DecodeBase64URL(pieces(0)).ToString(Text.Encodings.UTF8))
+            claims = ParseAuthJSON(DecodeBase64URL(pieces(1)).ToString(Text.Encodings.UTF8))
+        Catch e As Exception
+            Throw New InvalidArgumentException("Malformed ID token")
+        End Try
+        If Not header.IsObject() Or Not claims.IsObject() Then Throw New InvalidArgumentException("Malformed ID token")
+        If Not Exact(RequiredString(header, "alg"), "RS256") Then Throw New InvalidArgumentException("ID-token signing algorithm is not allowed")
+        If header.HasKey("crit") Or header.HasKey("b64") Then Throw New InvalidArgumentException("Unsupported ID-token header extension")
+        Dim kid As String = RequiredString(header, "kid")
+        Dim keySet As JSONItem = Me.RequestJSON(Me.TrustedEndpoint(RequiredString(metadata, "jwks_uri")), "", False)
+        Dim keys As JSONItem = keySet.Value("keys")
+        If Not keys.IsArray() Or keys.Count() > 100 Then Throw New InvalidArgumentException("Invalid issuer key set")
+        Dim selected As JSONItem = Nil
+        For i As Integer = 0 To keys.Count() - 1
+            Dim candidate As JSONItem = keys.ValueAt(i)
+            If Exact(candidate.Value("kid").AsString().Or(""), kid) Then
+                If selected <> Nil Then Throw New InvalidArgumentException("Ambiguous issuer key ID")
+                selected = candidate
+            End If
+        Next
+        If selected = Nil Then Throw New InvalidArgumentException("ID-token signing key was not found")
+        If Not Exact(RequiredString(selected, "kty"), "RSA") Then Throw New InvalidArgumentException("ID-token key type is not allowed")
+        If selected.HasKey("alg") Then
+            If Not Exact(RequiredString(selected, "alg"), "RS256") Then Throw New InvalidArgumentException("Issuer key algorithm does not match")
+        End If
+        If selected.HasKey("use") Then
+            If Not Exact(RequiredString(selected, "use"), "sig") Then Throw New InvalidArgumentException("Issuer key is not a signature key")
+        End If
+        If selected.HasKey("key_ops") Then
+            Dim operations As JSONItem = selected.Value("key_ops")
+            If Not operations.IsArray() Then Throw New InvalidArgumentException("Invalid issuer key operations")
+            Dim verificationAllowed As Boolean = False
+            For i As Integer = 0 To operations.Count() - 1
+                If Not operations.ValueAt(i).IsString() Then Throw New InvalidArgumentException("Invalid issuer key operation")
+                If Exact(operations.ValueAt(i).AsString().Value, "verify") Then verificationAllowed = True
+            Next
+            If Not verificationAllowed Then Throw New InvalidArgumentException("Issuer key does not permit verification")
+        End If
+        Dim modulus As Bytes = DecodeBase64URL(RequiredString(selected, "n"))
+        Dim exponent As Bytes = DecodeBase64URL(RequiredString(selected, "e"))
+        Dim signed As Bytes = Utf8(pieces(0) + "." + pieces(1))
+        Dim signature As Bytes = DecodeBase64URL(pieces(2))
+        If VerifyRSA(modulus.DataPtr(), modulus.Count, exponent.DataPtr(), exponent.Count, signed.DataPtr(), signed.Count, signature.DataPtr(), signature.Count) <> 1 Then Throw New InvalidArgumentException("ID-token signature validation failed")
+        If Not Exact(RequiredString(claims, "iss"), Me.IssuerURL) Then Throw New InvalidArgumentException("ID-token issuer does not match")
+        Dim audience As JSONItem = claims.Value("aud")
+        Dim matches As Boolean = False
+        If audience.IsString() Then
+            matches = Exact(audience.AsString().Value, issuedClient)
+        ElseIf audience.IsArray() Then
+            For i As Integer = 0 To audience.Count() - 1
+                Dim entry As JSONItem = audience.ValueAt(i)
+                If Not entry.IsString() Then Throw New InvalidArgumentException("Invalid ID-token audience")
+                If Exact(entry.AsString().Value, issuedClient) Then matches = True
+            Next
+            If audience.Count() > 1 Then
+                If Not Exact(RequiredString(claims, "azp"), issuedClient) Then Throw New InvalidArgumentException("ID-token authorized party does not match")
+            End If
+        End If
+        If Not matches Then Throw New InvalidArgumentException("ID-token audience does not match issued client")
+        If claims.HasKey("azp") Then
+            If Not Exact(RequiredString(claims, "azp"), issuedClient) Then Throw New InvalidArgumentException("ID-token authorized party does not match")
+        End If
+        Dim issued As Integer = NumberField(claims, "iat")
+        Dim expires As Integer = NumberField(claims, "exp")
+        Dim now As Integer = UnixNow()
+        If (expires <= now And Not allowExpired) Or issued > now + 60 Or expires <= issued Then Throw New InvalidArgumentException("ID-token validity period is invalid")
+        If claims.HasKey("nbf") Then
+            If NumberField(claims, "nbf") > now + 60 Then Throw New InvalidArgumentException("ID token is not active")
+        End If
+        If requireNonce Or claims.HasKey("nonce") Then
+            If Not SameSecret(RequiredString(claims, "nonce"), nonce) Then Throw New InvalidArgumentException("ID-token nonce does not match")
+        End If
+        RequiredString(claims, "sub")
+        Return claims
+    End Function
+
+    Private Function ReadTokens(response As JSONItem, oldTokens As ChatGPTTokens) As ChatGPTTokens
+        Dim tokens As New ChatGPTTokens()
+        tokens.Access = RequiredString(response, "access_token")
+        tokens.Refresh = RequiredString(response, "refresh_token")
+        If Not Exact(String.LCase(RequiredString(response, "token_type")), "bearer") Then Throw New InvalidArgumentException("Unsupported OAuth token type")
+        Dim lifetime As Integer = NumberField(response, "expires_in")
+        If lifetime < 1 Or lifetime > 86400 Then Throw New InvalidArgumentException("Invalid access-token lifetime")
+        tokens.Received = UnixNow()
+        tokens.Expires = tokens.Received + lifetime
+        If response.HasKey("earliest_refresh_at") Then tokens.EarliestRefresh = NumberField(response, "earliest_refresh_at")
+        If response.HasKey("scope") Then
+            tokens.Scopes = response.Value("scope").AsString().Or("")
+            If Not response.Value("scope").IsString() Then Throw New InvalidArgumentException("Invalid granted scopes")
+        ElseIf oldTokens <> Nil Then
+            tokens.Scopes = oldTokens.Scopes
+        Else
+            Throw New InvalidArgumentException("Granted scopes are missing")
+        End If
+        If response.HasKey("id_token") Then
+            tokens.Identity = RequiredString(response, "id_token")
+        ElseIf oldTokens <> Nil Then
+            tokens.Identity = oldTokens.Identity
+        Else
+            Throw New InvalidArgumentException("ID token is missing")
+        End If
+        Return tokens
+    End Function
+
+    Public Function Exchange(attempt As ChatGPTSignIn) As ChatGPTProfile
+        If attempt = Nil Then Throw New InvalidArgumentException("Sign-in attempt is required")
+        If attempt.Owner <> Me Or attempt.Used Or Not attempt.CallbackReady Or UnixNow() - attempt.StartedAt > 600 Then Throw New InvalidArgumentException("Invalid or consumed sign-in attempt")
+        attempt.Used = True
+        Dim form As String = "grant_type=authorization_code&client_id=" + Encode(attempt.ClientValue) + "&code=" + Encode(attempt.Code) + "&code_verifier=" + Encode(attempt.Verifier) + "&redirect_uri=" + Encode(attempt.RedirectURI) + "&resource=" + Encode(Resource)
+        attempt.Verifier = ""
+        attempt.Code = ""
+        Dim metadata As JSONItem = Me.Discovery()
+        Dim response As JSONItem = Me.RequestJSON(Me.IssuerURL + "/api/accounts/oauth/token", form, True)
+        Dim tokens As ChatGPTTokens = Me.ReadTokens(response, Nil)
+        Dim claims As JSONItem = Me.VerifyIdentity(tokens.Identity, attempt.ClientValue, attempt.NonceValue, True, metadata)
+        Dim subject As String = RequiredString(claims, "sub")
+        If attempt.Profile <> Nil Then
+            If Not Exact(subject, attempt.Profile.Subject) Then Throw New InvalidArgumentException("Sign-in identity does not match selected registration")
+        End If
+        Dim profile As New ChatGPTProfile()
+        profile.IssuerValue = Me.IssuerURL
+        profile.ClientValue = attempt.ClientValue
+        profile.HostValue = Me.HostID
+        profile.SubjectValue = subject
+        profile.EmailValue = claims.Value("email").AsString().Or("")
+        profile.CallbackPath = attempt.PathValue
+        profile.Nonce = attempt.NonceValue
+        profile.Tokens = tokens
+        Return profile
+    End Function
+
+    ''' Restore a protected credential record as refresh-only; no saved bearer or permission is trusted.
+    Public Function RestoreProfile(record As JSONItem) As ChatGPTProfile
+        If record = Nil Then Throw New InvalidArgumentException("Credential record is required")
+        If Not record.IsObject() Then Throw New InvalidArgumentException("Credential record must be an object")
+        If Not Exact(RequiredString(record, "issuer"), Me.IssuerURL) Or Not Exact(RequiredString(record, "ext_agent_host_id"), Me.HostID) Then Throw New InvalidArgumentException("Credential record belongs to another host or issuer")
+        Dim issuedClient As String = RequiredString(record, "client_id")
+        If Exact(issuedClient, DynamicClient) Then Throw New InvalidArgumentException("Credential record lacks an issued client ID")
+        Dim nonce As String = RequiredString(record, "nonce")
+        Dim identity As String = RequiredString(record, "id_token")
+        Dim metadata As JSONItem = Me.Discovery()
+        Dim claims As JSONItem = Me.VerifyIdentity(identity, issuedClient, nonce, True, metadata, True)
+        Dim subject As String = RequiredString(claims, "sub")
+        If Not Exact(subject, RequiredString(record, "subject")) Then Throw New InvalidArgumentException("Credential record identity does not match")
+        Dim callbackPath As String = RequiredString(record, "callback_path")
+        ValidateCallbackPath(callbackPath)
+        Dim profile As New ChatGPTProfile()
+        profile.IssuerValue = Me.IssuerURL
+        profile.HostValue = Me.HostID
+        profile.ClientValue = issuedClient
+        profile.SubjectValue = subject
+        profile.EmailValue = claims.Value("email").AsString().Or("")
+        profile.CallbackPath = callbackPath
+        profile.Nonce = nonce
+        Dim tokens As New ChatGPTTokens()
+        tokens.Refresh = RequiredString(record, "refresh_token")
+        If record.HasKey("earliest_refresh_at") Then tokens.EarliestRefresh = NumberField(record, "earliest_refresh_at")
+        tokens.Identity = identity
+        profile.Tokens = tokens
+        Return profile
+    End Function
+
+    ''' Caller must serialize refreshes per profile across all threads/processes.
+    Public Sub Refresh(profile As ChatGPTProfile)
+        Me.RequireProfile(profile)
+        If profile.Tokens = Nil Then Throw New InvalidArgumentException("Profile has no renewable session")
+        Dim oldTokens As ChatGPTTokens = profile.Tokens
+        If oldTokens.EarliestRefresh > UnixNow() Then Throw New InvalidArgumentException("Session cannot be refreshed yet")
+        Dim metadata As JSONItem = Me.Discovery()
+        Dim form As String = "grant_type=refresh_token&client_id=" + Encode(profile.ClientID) + "&refresh_token=" + Encode(oldTokens.Refresh) + "&resource=" + Encode(Resource)
+        Dim response As JSONItem = Me.RequestJSON(Me.IssuerURL + "/api/accounts/oauth/token", form, True)
+        Dim replacement As ChatGPTTokens = Me.ReadTokens(response, oldTokens)
+        If response.HasKey("id_token") Then
+            Dim claims As JSONItem = Me.VerifyIdentity(replacement.Identity, profile.ClientID, profile.Nonce, False, metadata)
+            If Not Exact(RequiredString(claims, "sub"), profile.Subject) Then Throw New InvalidArgumentException("Refresh identity does not match registration")
+        End If
+        profile.Tokens = replacement
+    End Sub
+
+    ''' Remote revocation must succeed before this method clears local tokens.
+    Public Sub Revoke(profile As ChatGPTProfile)
+        Me.RequireProfile(profile)
+        If profile.Tokens = Nil Then Return
+        Dim metadata As JSONItem = Me.Discovery()
+        Dim endpoint As String = Me.TrustedEndpoint(RequiredString(metadata, "revocation_endpoint"))
+        Dim connection As New URLConnection()
+        connection.FollowRedirects = False
+        connection.VerifySSL = True
+        connection.Timeout = 30
+        connection.ConnectionTimeout = 15
+        connection.RequestHeaders.Set("Content-Type", "application/x-www-form-urlencoded")
+        Try
+            connection.Post(endpoint, "token=" + Encode(profile.Tokens.Refresh) + "&token_type_hint=refresh_token&client_id=" + Encode(profile.ClientID))
+        Catch e As NetworkingException
+            Throw New NetworkingException("Session revocation was not confirmed")
+        End Try
+        If connection.HTTPStatus = 429 Or connection.HTTPStatus >= 500 Then Throw New NetworkingException("ChatGPT authentication endpoint temporarily unavailable")
+        If connection.HTTPStatus <> 200 Then Throw New InvalidArgumentException("Session revocation was not confirmed")
+        profile.ClearCredentials()
+    End Sub
+End Class

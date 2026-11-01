@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "name": "chatgptauth",
+  "version": "0.1.0",
+  "description": "Sign in with ChatGPT public-client PKCE, validated identity, renewable account sessions",
+  "libraries": [
+    {
+      "libName": "buoy_chatgptauth",
+      "system": false,
+      "platforms": [
+        "arm64-apple-macos",
+        "x86_64-apple-macos",
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu"
+      ]
+    }
+  ]
+}

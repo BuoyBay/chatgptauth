@@ -1,0 +1,12 @@
+Import chatgptauth
+
+' Offline demonstration only. A GUI host binds this callback before opening the system browser.
+Sub Main()
+    Dim hostID As String = NewChatGPTHostID()
+    Dim auth As New ChatGPTAuthClient("Buoy Studio", hostID)
+    Dim pending As ChatGPTSignIn = auth.Begin(1455)
+    Print "Continue with ChatGPT"
+    Print "Bind a loopback listener before opening the authorization URL."
+    Print "Callback: " + pending.CallbackURI
+    Print "No browser was opened and no account or inference request was made."
+End Sub
