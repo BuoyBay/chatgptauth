@@ -1,6 +1,6 @@
 # ChatGPT sign-in and renewable account sessions
 
-A Buoy public-client OAuth package implementing OpenAI's supported open-source
+A public-client OAuth package implementing OpenAI's supported open-source
 Sign in with ChatGPT flow. It uses authorization-code PKCE, verifies RS256 ID
 tokens against the issuer's JWKS, binds identities to issued client registrations,
 and manages renewable in-memory sessions. It neither opens a browser nor writes
@@ -26,7 +26,7 @@ consumer project for reproducible installs.
 
 ## Example
 
-```buoy
+```basic
 Import chatgptauth
 
 Sub Main()
@@ -56,7 +56,6 @@ On your own machine, install Buoy and run:
 buoy ai init --both
 ```
 
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 

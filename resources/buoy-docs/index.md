@@ -21,6 +21,6 @@ A verified identity is not permission to use every model. `PlanEnabled` and `Acc
 
 ## Platform requirements
 
-The package requires Buoy 0.72+, the bundled `crypto` package, and its native RS256 bridge. macOS uses Security/CoreFoundation, Windows uses BCrypt, and Linux requires OpenSSL 3 at runtime. Current source documentation records runtime verification on Linux x86_64 and macOS arm64; Windows x86_64 was cross-linked, while Windows and Intel Mac runtime execution remain unverified.
+The package requires Buoy 0.72+, the bundled `crypto` package, and its native RS256 bridge. macOS uses Security/CoreFoundation, Windows uses BCrypt, and Linux requires OpenSSL 3 at runtime. Deploy the native bridge for the consumer's architecture and validate the complete authentication flow on that host.
 
 Start with the [getting-started guide](getting-started.md), then read the [API reference](api.md) for profile renewal, persistence, and token handoff.

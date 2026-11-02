@@ -55,5 +55,4 @@ For Codex custom-provider integration, inject `ChildEnvironment()` into that one
 
 Continue with [Getting started](getting-started.md) or return to the [overview](index.md).
 
-
 [Full typed API: properties, parameters, defaults, and returns](typed-api.md)

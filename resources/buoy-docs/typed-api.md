@@ -13,8 +13,6 @@ related: ["api.md", "getting-started.md", "index.md"]
 
 Generated from the package source declarations. Platform guards are shown where present; inherited members are documented on the base type. See the [API contracts](api.md) for behavior and limitations.
 
-## ChatGPTAuth functions
-
 ### Base64URL
 
 `Public Function Base64URL(data As Bytes) As String`

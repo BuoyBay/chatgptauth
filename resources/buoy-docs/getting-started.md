@@ -15,7 +15,7 @@ Place `chatgptauth-0.1.0.buipkg` and Buoy's bundled `crypto-1.0.0.buipkg` in the
 
 This complete offline example demonstrates host identity, the client, the expected callback address, and cancellation. A production host persists its host ID rather than generating a new one every launch. No listener is bound and no browser or token exchange occurs here.
 
-```buoy
+```basic
 Import chatgptauth
 
 Sub Main()
