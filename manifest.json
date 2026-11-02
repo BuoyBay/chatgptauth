@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "chatgptauth",
   "version": "0.1.0",
-  "description": "Sign in with ChatGPT public-client PKCE, validated identity, renewable account sessions",
+  "description": "ChatGPT public-client PKCE sign-in and renewable sessions",
   "libraries": [
     {
       "libName": "buoy_chatgptauth",
