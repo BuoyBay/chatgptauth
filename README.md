@@ -1,4 +1,4 @@
-# ChatGPT public-client PKCE sign-in and renewable sessions
+# ChatGPT PKCE sign-in
 
 A public-client OAuth package implementing OpenAI's supported open-source
 Sign in with ChatGPT flow. It uses authorization-code PKCE, verifies RS256 ID
